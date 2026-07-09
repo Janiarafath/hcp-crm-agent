@@ -1,5 +1,3 @@
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage, ToolMessage
-from typing import TypedDict, List
 from app.tools.hcp_tools import (
     log_interaction, 
     edit_interaction, 
@@ -7,46 +5,101 @@ from app.tools.hcp_tools import (
     get_interaction_history, 
     create_follow_up
 )
+from typing import TypedDict, Literal
 import json
 import os
+import httpx
+import re
 from dotenv import load_dotenv
-from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
 load_dotenv()
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 
 tools = [log_interaction, edit_interaction, search_hcp, get_interaction_history, create_follow_up]
 tools_map = {t.name: t for t in tools}
 
-llm = ChatNVIDIA(
-    model="meta/llama-3.1-8b-instruct",
-    api_key=NVIDIA_API_KEY,
-    temperature=0.2,
-    max_tokens=1024
-)
+LLM_EXTRACT_PROMPT = """You extract structured data from CRM meeting descriptions.
+Return ONLY a JSON object with these fields if the message describes a meeting:
+- "tool": always "log_interaction"
+- "args": { "hcp_name": string, "topics": string, "sentiment": "Positive"|"Neutral"|"Negative", "materials": string, "samples": "yes"|"no", "outcomes": string, "follow_up": string, "type": "Meeting"|"Call"|"Email" }
 
-llm_with_tools = llm.bind_tools(tools)
+Sentiment: Positive if words like interested/great/positive/excited/good. Negative if concerned/negative/bad/worried. Otherwise Neutral.
 
-system_prompt = """You are an AI assistant for a Healthcare CRM system.
+If the message is NOT describing a meeting with a doctor/HCP, return empty JSON: {}"""
 
-Available tools:
-- log_interaction(interaction_data: str) — Save a new HCP interaction. Pass JSON with fields like hcp_name, topics, sentiment, materials, samples, outcomes, follow_up, type.
-- edit_interaction(interaction_id, field_name, field_value) — Modify an existing interaction. Use field names like sentiment, topics, materials, hcp_name, outcomes, follow_up.
-- search_hcp(hcp_name: str) — Find interactions by doctor name.
-- get_interaction_history(interaction_id) — Get full details of a specific interaction.
-- create_follow_up(interaction_id, follow_up_note: str) — Add a follow-up action.
+# ------- LangGraph State -------
 
-RULES:
-1. When user describes a meeting, call log_interaction ONCE with all extracted info. Do NOT ask for missing fields.
-2. Use today's date as default.
-3. When user says "search" or "find", call search_hcp. Do NOT call any other tool.
-4. When user says "show me interaction X" or "get interaction X", call get_interaction_history.
-5. When user corrects or says "actually", call edit_interaction.
-6. When user says "follow-up" or "add follow-up", call create_follow_up.
-7. Call ONLY ONE tool per request unless the user's request explicitly needs multiple steps.
-8. Respond with a brief 1-line confirmation after tool calls.
-"""
+class AgentState(TypedDict):
+    user_message: str
+    tool_name: str
+    tool_args: dict
+    tool_result: str
+    response: str
+
+# ------- Tool Routing (rule-based, no LLM) -------
+
+def _route_tool(user_message: str):
+    msg = user_message.lower()
+    
+    edit_kw = ["edit", "actually", "correct", "change", "update", "wrong", "mistake", "fix", "should be", "not correct", "not right"]
+    follow_kw = ["follow-up", "follow up", "followup", "next step", "reminder"]
+    search_kw = ["search", "find", "look up", "what do we have", "past interaction", "previous", "history of", "info on", "details on", "tell me about"]
+    history_kw = ["last interaction", "last one", "pull up", "show details", "get details", "interaction details", "history of interaction"]
+    meeting_kw = [" met ", " meeting", " visited", " talked to", "discussed with", "saw ", "spoke with", " called "]
+    
+    if any(k in msg for k in edit_kw):
+        return "edit_interaction"
+    if any(k in msg for k in follow_kw):
+        return "create_follow_up"
+    if re.search(r'(?:show|get|view)\s+(?:me\s+)?(?:interaction\s*)?#?\s*\d+', msg):
+        return "get_interaction_history"
+    if any(k in msg for k in history_kw):
+        return "get_interaction_history"
+    if any(k in msg for k in search_kw):
+        return "search_hcp"
+    if any(k in msg for k in meeting_kw):
+        return "log_interaction"
+    
+    return None
+
+def _extract_name(msg: str):
+    m = re.search(r'(?:dr\.?\s*|doctor\s+)([A-Za-z]+)', msg, re.IGNORECASE)
+    return m.group(0).strip() if m else None
+
+def _extract_id(msg: str):
+    m = re.search(r'(?:interaction\s*)?#?\s*(\d+)', msg)
+    return int(m.group(1)) if m else None
+
+def _llm_extract_meeting(messages, model="mistralai/mixtral-8x7b-instruct-v0.1", max_retries=2):
+    """LLM used ONLY for entity extraction from meeting descriptions."""
+    msgs = [{"role": "system", "content": LLM_EXTRACT_PROMPT}] + messages
+    payload = {"model": model, "messages": msgs, "temperature": 0.1, "max_tokens": 512}
+    
+    for attempt in range(max_retries):
+        for key_name, key_val in [("NVIDIA", NVIDIA_API_KEY), ("Groq", GROQ_API_KEY)]:
+            if not key_val:
+                continue
+            base = "https://integrate.api.nvidia.com/v1" if key_name == "NVIDIA" else "https://api.groq.com/openai/v1"
+            try:
+                with httpx.Client(timeout=60.0) as client:
+                    r = client.post(
+                        f"{base}/chat/completions",
+                        headers={"Authorization": f"Bearer {key_val}", "Content-Type": "application/json"},
+                        json=payload
+                    )
+                    if r.status_code == 200:
+                        text = r.json()["choices"][0]["message"]["content"]
+                        m = re.search(r'\{.*\}', text, re.DOTALL)
+                        if m:
+                            clean = m.group(0).replace('\\_', '_').replace('\\n', '\n')
+                            return json.loads(clean)
+                    elif r.status_code == 429:
+                        continue
+            except:
+                continue
+    return None
 
 def execute_tool(tool_name: str, tool_args: dict) -> str:
     tool = tools_map.get(tool_name)
@@ -58,115 +111,214 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
-last_logged_id = None
+# ------- LangGraph Nodes -------
+
+_last_id = None
+
+def node_route(state: AgentState) -> AgentState:
+    tool_name = _route_tool(state["user_message"])
+    return {"user_message": state["user_message"], "tool_name": tool_name or "none", "tool_args": {}, "tool_result": "", "response": ""}
+
+def node_extract(state: AgentState) -> AgentState:
+    if state["tool_name"] == "log_interaction":
+        extracted = _llm_extract_meeting([{"role": "user", "content": state["user_message"]}])
+        if extracted and extracted.get("tool") == "log_interaction":
+            fields = {"hcp_name":"","topics":"","sentiment":"Neutral","materials":"","samples":"no","outcomes":"","follow_up":"","type":"Meeting"}
+            fields.update(extracted.get("args", {}))
+            return {**state, "tool_args": {"interaction_data": json.dumps(fields)}}
+        return {**state, "tool_name": "none"}
+    return state
+
+def node_build_args(state: AgentState) -> AgentState:
+    if state["tool_name"] == "none":
+        return state
+    global _last_id
+    msg = state["user_message"]
+    tname = state["tool_name"]
+    targs = {}
+    
+    if tname == "search_hcp":
+        targs = {"hcp_name": _extract_name(msg) or "Dr. Name"}
+    elif tname == "get_interaction_history":
+        aid = _extract_id(msg)
+        if aid is None and _last_id:
+            aid = _last_id
+        if aid:
+            targs = {"interaction_id": int(aid)}
+        else:
+            return {**state, "tool_name": "none", "response": "No interactions logged yet. Try logging a meeting first, or specify an ID like 'show interaction #119'."}
+    elif tname == "edit_interaction":
+        aid = _extract_id(msg)
+        if aid is None and _last_id:
+            aid = _last_id
+        if not aid:
+            return {**state, "tool_name": "none", "response": "Please specify which interaction to edit."}
+        field = "sentiment"
+        for kw in ["sentiment", "name", "topic", "material", "hcp_name", "topics"]:
+            if kw in msg.lower():
+                field = kw
+                break
+        m2 = re.search(r'(?:to|as|should be)\s+(\w+)', msg, re.IGNORECASE)
+        value = m2.group(1) if m2 else ""
+        targs = {"interaction_id": int(aid), "field_name": field, "field_value": value}
+    elif tname == "create_follow_up":
+        aid = _extract_id(msg)
+        if aid is None and _last_id:
+            aid = _last_id
+        if not aid:
+            return {**state, "tool_name": "none", "response": "Please specify which interaction to add a follow-up to."}
+        m3 = re.search(r'(?:follow-up|follow up|followup)[:\s]*(.*)', msg, re.IGNORECASE)
+        note = m3.group(1).strip() if m3 else msg
+        targs = {"interaction_id": int(aid), "follow_up_note": note}
+    
+    return {**state, "tool_args": targs}
+
+def node_execute(state: AgentState) -> AgentState:
+    global _last_id
+    result = execute_tool(state["tool_name"], state["tool_args"])
+    
+    if state["tool_name"] == "log_interaction":
+        try:
+            r = json.loads(result)
+            if r.get("status") == "success":
+                _last_id = r.get("interaction_id")
+        except:
+            pass
+    
+    return {**state, "tool_result": result}
+
+def node_respond(state: AgentState) -> AgentState:
+    if state.get("response"):
+        return state
+    
+    result_str = state["tool_result"]
+    
+    if not result_str:
+        response = "How can I help you? Try describing a meeting, searching for an HCP, or editing an interaction."
+    elif '"status": "success"' in result_str:
+        tname = state["tool_name"]
+        try:
+            data = json.loads(result_str)
+            if tname == "log_interaction":
+                response = f"Interaction #{data.get('interaction_id', '?')} logged successfully."
+            elif tname == "edit_interaction":
+                response = "Interaction updated successfully."
+            elif tname == "search_hcp":
+                response = f"Found {len(data.get('data', []))} past interaction(s)."
+            elif tname == "get_interaction_history":
+                response = "Interaction details retrieved."
+            elif tname == "create_follow_up":
+                response = "Follow-up added successfully."
+            else:
+                response = "Done."
+        except:
+            response = "Done."
+    else:
+        try:
+            response = f"Error: {json.loads(result_str).get('message', 'unknown')}"
+        except:
+            response = "An error occurred."
+    
+    return {**state, "response": response}
+
+def router(state: AgentState) -> Literal["extract", "build_args", "execute", "respond"]:
+    tn = state["tool_name"]
+    if tn == "log_interaction" and not state["tool_args"]:
+        return "extract"
+    if tn == "none":
+        return "respond"
+    if tn != "" and state["tool_args"] and not state["tool_result"]:
+        return "execute"
+    if tn != "" and state["tool_result"] and not state["response"]:
+        return "respond"
+    return "build_args"
+
+# ------- Build LangGraph Graph -------
+
+try:
+    from langgraph.graph import StateGraph, END
+    
+    workflow = StateGraph(AgentState)
+    
+    workflow.add_node("route", node_route)
+    workflow.add_node("extract", node_extract)
+    workflow.add_node("build_args", node_build_args)
+    workflow.add_node("execute", node_execute)
+    workflow.add_node("respond", node_respond)
+    
+    workflow.set_entry_point("route")
+    
+    for node in ["route", "extract", "build_args"]:
+        workflow.add_conditional_edges(node, router, {
+            "extract": "extract",
+            "build_args": "build_args",
+            "execute": "execute",
+            "respond": "respond"
+        })
+    
+    workflow.add_edge("execute", "respond")
+    workflow.add_edge("respond", END)
+    
+    langgraph_app = workflow.compile()
+    LANGGRAPH_AVAILABLE = True
+except ImportError:
+    LANGGRAPH_AVAILABLE = False
+    langgraph_app = None
+
+# ------- Public API -------
 
 def process_message(user_message: str, history: list = None) -> dict:
-    global last_logged_id
-
-    if history is None:
-        history = []
-
-    edit_keywords = ["edit", "actually", "correct", "change", "update", "wrong", "mistake", "sorry"]
-    followup_keywords = ["follow-up", "follow up", "followup"]
-    needs_id = any(kw in user_message.lower() for kw in edit_keywords + followup_keywords)
-    has_id = any(word.startswith(("interaction", "id", "#")) for word in user_message.lower().split())
-    if needs_id and not has_id and last_logged_id:
-        user_message = f"{user_message} (Interaction ID: {last_logged_id})"
-
-    truncated_history = history[-6:] if len(history) > 6 else history
-    messages = [SystemMessage(content=system_prompt)] + truncated_history + [HumanMessage(content=user_message)]
-
-    max_iterations = 3
-    tool_results_all = []
-    seen_calls = set()
-
-    for i in range(max_iterations):
-        response = llm_with_tools.invoke(messages)
-        messages.append(response)
-
-        if not hasattr(response, "tool_calls") or not response.tool_calls:
-            break
-
-        for tc in response.tool_calls:
-            tool_name = tc["name"]
-            tool_args = dict(tc["args"])
-
-            if tool_name in ("edit_interaction", "create_follow_up", "get_interaction_history"):
-                aid = tool_args.get("interaction_id")
-                if aid is not None and not isinstance(aid, int):
-                    try:
-                        tool_args["interaction_id"] = int(str(aid))
-                    except (ValueError, TypeError):
-                        if last_logged_id:
-                            tool_args["interaction_id"] = last_logged_id
-                        else:
-                            tool_args.pop("interaction_id", None)
-                if "interaction_id" not in tool_args and last_logged_id:
-                    tool_args["interaction_id"] = last_logged_id
-
-            if tool_name == "log_interaction":
-                raw = tool_args.get("interaction_data", "")
-                if isinstance(raw, str):
-                    try:
-                        json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-
-            call_key = f"{tool_name}:{json.dumps(tool_args, sort_keys=True)}"
-            if call_key in seen_calls:
-                continue
-            seen_calls.add(call_key)
-
-            tool_result = execute_tool(tool_name, tool_args)
-
-            if tool_name == "log_interaction":
+    global _last_id
+    initial = AgentState(
+        user_message=user_message,
+        tool_name="",
+        tool_args={},
+        tool_result="",
+        response=""
+    )
+    
+    if LANGGRAPH_AVAILABLE and langgraph_app:
+        final = langgraph_app.invoke(initial)
+        resp = final.get("response", "How can I help you?")
+        tc = []
+        if final.get("tool_name") and final["tool_name"] != "none" and final.get("tool_result"):
+            tc.append({
+                "tool": final["tool_name"],
+                "args": final.get("tool_args", {}),
+                "result": final.get("tool_result", "")
+            })
+        return {"response": resp, "tool_calls": tc, "messages": [{"role": "user", "content": user_message}]}
+    else:
+        tool_name = _route_tool(user_message)
+        if not tool_name:
+            return {"response": "How can I help you? Try describing a meeting, searching for an HCP, or editing an interaction.", "tool_calls": [], "messages": [{"role": "user", "content": user_message}]}
+        
+        args = {}
+        result = ""
+        
+        if tool_name == "log_interaction":
+            extracted = _llm_extract_meeting([{"role": "user", "content": user_message}])
+            if extracted and extracted.get("tool") == "log_interaction":
+                fields = {"hcp_name":"","topics":"","sentiment":"Neutral","materials":"","samples":"no","outcomes":"","follow_up":"","type":"Meeting"}
+                fields.update(extracted.get("args", {}))
+                args = {"interaction_data": json.dumps(fields)}
+                result = execute_tool("log_interaction", args)
                 try:
-                    res = json.loads(tool_result)
-                    if res.get("status") == "success":
-                        last_logged_id = res.get("interaction_id")
+                    r = json.loads(result)
+                    if r.get("status") == "success":
+                        _last_id = r.get("interaction_id")
                 except:
                     pass
-
-            tool_results_all.append({
-                "tool": tool_name,
-                "args": tool_args,
-                "result": tool_result
-            })
-            messages.append(ToolMessage(content=tool_result, tool_call_id=tc["id"]))
-
-    successful = [tc for tc in tool_results_all if '"status": "success"' in str(tc.get("result", ""))]
-    errors = [tc for tc in tool_results_all if '"status": "error"' in str(tc.get("result", ""))]
-    
-    if successful:
-        last_tool = successful[-1]
-        tname = last_tool["tool"]
-        if tname == "log_interaction":
+        
+        if result and '"status": "success"' in result:
             try:
-                rid = json.loads(last_tool["result"]).get("interaction_id")
-                ai_response = f"Interaction #{rid} logged successfully."
+                data = json.loads(result)
+                response = f"Interaction #{data.get('interaction_id', '?')} logged successfully."
             except:
-                ai_response = "Interaction logged successfully."
-        elif tname == "edit_interaction":
-            ai_response = "Interaction updated successfully."
-        elif tname == "search_hcp":
-            try:
-                data = json.loads(last_tool["result"]).get("data", [])
-                ai_response = f"Found {len(data)} interaction(s)."
-            except:
-                ai_response = "Search complete."
-        elif tname == "get_interaction_history":
-            ai_response = "Interaction details retrieved."
-        elif tname == "create_follow_up":
-            ai_response = "Follow-up added successfully."
+                response = "Done."
+        elif not result:
+            response = "How can I help you?"
         else:
-            ai_response = "Done."
-    elif errors:
-        ai_response = "Something went wrong. Try again."
-    else:
-        ai_response = "How can I help you?"
-
-    return {
-        "response": ai_response,
-        "tool_calls": tool_results_all,
-        "messages": [{"role": m.type, "content": m.content} for m in messages if isinstance(m, (HumanMessage, AIMessage)) and m.content]
-    }
+            response = f"Error: {json.loads(result).get('message', 'unknown')}"
+        
+        return {"response": response, "tool_calls": [{"tool": tool_name, "args": args, "result": result}] if result else [], "messages": [{"role": "user", "content": user_message}]}
