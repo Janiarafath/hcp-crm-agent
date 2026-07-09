@@ -54,7 +54,8 @@ An AI-powered CRM system for Healthcare Professional (HCP) interactions with a *
 
 ### Backend
 - FastAPI server with LangGraph agent loop
-- NVIDIA API (llama-3.1-8b-instruct) for LLM inference
+- **NVIDIA NIM** as primary LLM provider — very high rate limits and generous free tier, no daily token caps
+- **Groq API** and **Gemini** as fallback providers (tested, code supports seamless switching)
 - SQLite database (swap to PostgreSQL via DATABASE_URL)
 
 ## Tech Stack
@@ -63,16 +64,19 @@ An AI-powered CRM system for Healthcare Professional (HCP) interactions with a *
 |-----------|------------|
 | Frontend | React 18, Redux Toolkit, Vite |
 | Backend | Python 3, FastAPI, LangGraph, LangChain |
-| LLM | NVIDIA NIM (meta/llama-3.1-8b-instruct) |
+| LLM | **NVIDIA NIM** (meta/llama-3.1-8b-instruct) — primary |
+| Fallback LLMs | Groq API (llama-3.3-70b-versatile), Gemini 2.0 Flash |
 | Database | SQLite (dev) / PostgreSQL (prod) |
 | UI | Custom CSS, Google Inter font |
+
+> **Why NVIDIA NIM?** Groq has daily token caps (100K TPD) and Gemini has per-minute rate limits (5 req/min). NVIDIA NIM offers significantly higher RPM and a very generous free tier, making it ideal for development without hitting rate limits.
 
 ## Quick Start
 
 ### Prerequisites
 - Node.js 18+
 - Python 3.9+
-- NVIDIA API key (or Groq/OpenAI key)
+- NVIDIA API key, Groq API key, or Gemini API key (see `.env.example`)
 
 ### Backend
 ```bash
