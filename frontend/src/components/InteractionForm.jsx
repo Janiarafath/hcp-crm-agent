@@ -1,6 +1,6 @@
 import React from 'react';
 import { useSelector, useDispatch } from 'react-redux';
-import { updateFormField } from '../store/crmSlice';
+import { updateFormField, saveInteraction } from '../store/crmSlice';
 
 const sentimentOptions = ['Positive', 'Neutral', 'Negative'];
 const interactionTypes = ['Meeting', 'Call', 'Conference', 'Email', 'Other'];
@@ -8,10 +8,15 @@ const interactionTypes = ['Meeting', 'Call', 'Conference', 'Email', 'Other'];
 const InteractionForm = () => {
   const dispatch = useDispatch();
   const formData = useSelector((state) => state.crm.formData);
+  const loading = useSelector((state) => state.crm.loading);
 
   const handleChange = (e) => {
     const { name, value } = e.target;
     dispatch(updateFormField({ field: name, value }));
+  };
+
+  const handleSave = () => {
+    dispatch(saveInteraction(formData));
   };
 
   return (
@@ -151,6 +156,17 @@ const InteractionForm = () => {
             placeholder="Schedule follow-up meeting, send additional data..."
             rows="2"
           />
+        </div>
+
+        <div className="form-actions">
+          <button
+            type="button"
+            className="save-button"
+            onClick={handleSave}
+            disabled={loading}
+          >
+            {loading ? 'Saving...' : 'Save Interaction'}
+          </button>
         </div>
       </form>
     </div>

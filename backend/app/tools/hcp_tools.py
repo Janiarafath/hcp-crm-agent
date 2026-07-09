@@ -1,3 +1,4 @@
+from typing import Union
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage, AIMessage
 from sqlalchemy.orm import Session
@@ -5,6 +6,54 @@ from app.models.database import HCPInteraction, SessionLocal
 from app.models.schemas import InteractionCreate
 from datetime import datetime
 import json
+
+FIELD_MAP = {
+    "hcp_name": "hcp_name",
+    "doctor_name": "hcp_name",
+    "doctor": "hcp_name",
+    "interaction_type": "interaction_type",
+    "type": "interaction_type",
+    "date": "date",
+    "time": "time",
+    "attendees": "attendees",
+    "topics_discussed": "topics_discussed",
+    "topics": "topics_discussed",
+    "topic": "topics_discussed",
+    "discussion_topics": "topics_discussed",
+    "voice_note_summary": "voice_note_summary",
+    "voice_note": "voice_note_summary",
+    "summary": "voice_note_summary",
+    "materials_shared": "materials_shared",
+    "materials": "materials_shared",
+    "material": "materials_shared",
+    "shared_materials": "materials_shared",
+    "samples_distributed": "samples_distributed",
+    "samples": "samples_distributed",
+    "hcp_sentiment": "hcp_sentiment",
+    "sentiment": "hcp_sentiment",
+    "outcomes": "outcomes",
+    "outcome": "outcomes",
+    "follow_up_actions": "follow_up_actions",
+    "follow_up": "follow_up_actions",
+    "followup": "follow_up_actions",
+    "follow": "follow_up_actions",
+    "raw_message": "raw_message",
+}
+
+SENTIMENT_MAP = {
+    "positive": "Positive",
+    "neutral": "Neutral",
+    "negative": "Negative",
+}
+
+def normalize_value(key, value):
+    if isinstance(value, list):
+        value = ", ".join(str(v) for v in value)
+    if isinstance(value, bool):
+        value = str(value)
+    if key == "hcp_sentiment" and isinstance(value, str):
+        return SENTIMENT_MAP.get(value.lower(), value)
+    return value
 
 @tool
 def log_interaction(interaction_data: str) -> str:
@@ -14,7 +63,13 @@ def log_interaction(interaction_data: str) -> str:
     Extracts doctor name, topics, sentiment, materials, outcomes, and follow-up actions.
     """
     try:
-        data = json.loads(interaction_data) if isinstance(interaction_data, str) else interaction_data
+        raw = json.loads(interaction_data) if isinstance(interaction_data, str) else interaction_data
+        
+        data = {}
+        for key, value in raw.items():
+            mapped_key = FIELD_MAP.get(key)
+            if mapped_key:
+                data[mapped_key] = normalize_value(mapped_key, value)
         
         db = SessionLocal()
         try:
@@ -59,12 +114,14 @@ def log_interaction(interaction_data: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 @tool
-def edit_interaction(interaction_id: int, field_name: str, field_value: str) -> str:
+def edit_interaction(interaction_id: Union[int, str], field_name: str, field_value: str) -> str:
     """
     Edit an existing HCP interaction. 
     Provide the interaction ID, field name to edit, and new value.
     """
     try:
+        interaction_id = int(interaction_id)
+        field_name = FIELD_MAP.get(field_name, field_name)
         db = SessionLocal()
         try:
             interaction = db.query(HCPInteraction).filter(HCPInteraction.id == interaction_id).first()
@@ -130,11 +187,12 @@ def search_hcp(hcp_name: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 @tool
-def get_interaction_history(interaction_id: int) -> str:
+def get_interaction_history(interaction_id: Union[int, str]) -> str:
     """
     Get full details of a specific interaction by ID.
     """
     try:
+        interaction_id = int(interaction_id)
         db = SessionLocal()
         try:
             interaction = db.query(HCPInteraction).filter(HCPInteraction.id == interaction_id).first()
@@ -168,11 +226,12 @@ def get_interaction_history(interaction_id: int) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 @tool
-def create_follow_up(interaction_id: int, follow_up_note: str) -> str:
+def create_follow_up(interaction_id: Union[int, str], follow_up_note: str) -> str:
     """
     Create or update a follow-up action for an existing interaction.
     """
     try:
+        interaction_id = int(interaction_id)
         db = SessionLocal()
         try:
             interaction = db.query(HCPInteraction).filter(HCPInteraction.id == interaction_id).first()
